@@ -150,10 +150,38 @@ pub async fn build<'a>(config: &crate::Config) -> Schema<'a> {
     let pool = crate::connection::build(config).await;
     let introspection = introspection::Introspection::from(&pool).await;
 
+    println!("{:#?}", introspection);
+
     let fields = {
         let mut fields_builder: Vec<Box<dyn Registrable>> = vec![];
 
         for relation in introspection.relations() {
+            let columns = {
+                let mut columns_builder: Vec<Box<dyn Registrable>> = vec![];
+
+                for column in relation.columns {
+                    columns_builder.push(Box::new(FieldInfo::<_, _> {
+                        name: column.name.clone(),
+                        resolver: |executor| {
+                            let f = async move {
+                                executor
+                                    .context()
+                                    .pool
+                                    .get()
+                                    .await
+                                    .unwrap()
+                                    .query_one("select 2", &[])
+                                    .await
+                                    .map(move |row| row.get::<_, i32>(0))
+                            };
+                            Box::pin(f)
+                        },
+                    }));
+                }
+
+                columns_builder
+            };
+
             fields_builder.push(Box::new(FieldInfo::<_, _> {
                 name: relation.name.clone(),
                 resolver: |executor| {

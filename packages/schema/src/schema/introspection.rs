@@ -1,7 +1,40 @@
 #[derive(Clone, Debug)]
+pub struct Column {
+    pub name: String,
+    pub type_id: i32,
+}
+
+#[derive(Clone, Debug)]
 pub struct Relation {
     pub name: String,
+    pub columns: Vec<Column>,
 }
+
+impl Relation {
+    pub fn from<'a>(client: &'a tokio_postgres::Transaction<'a>, oid: i32, name: String) -> juniper::BoxFuture<'a, Self> {
+        Box::pin(async move {
+            let query = "
+                select attname, atttypid::int
+                from pg_attribute
+                where attrelid = $1::int::oid and attnum >= 1
+            ";
+
+            let columns = client
+                .query(query, &[&oid])
+                .await
+                .unwrap()
+                .iter()
+                .map(|table| Column {
+                    name: table.get("attname"),
+                    type_id: table.get("atttypid"),
+                })
+                .collect();
+
+            Self { name, columns }
+        })
+    }
+}
+
 
 #[derive(Clone, Debug)]
 pub struct Schema {
@@ -10,26 +43,46 @@ pub struct Schema {
 }
 
 impl Schema {
-    pub fn from(pool: &crate::connection::Pool, name: String) -> juniper::BoxFuture<Self> {
+    pub fn from<'a>(client: &'a tokio_postgres::Transaction<'a>, name: String) -> juniper::BoxFuture<'a, Self> {
         Box::pin(async move {
             let query = "
-                select table_name as name
-                from information_schema.tables
-                where table_schema = $1::text
+                select oid::int
+                from pg_namespace
+                where nspname = $1::text
             ";
 
-            let relations = pool
-                .get()
+            let oid = client
+                .query_opt(query, &[&name])
                 .await
                 .unwrap()
-                .query(query, &[&name])
+                .unwrap()
+                .get::<_, i32>(0);
+
+            let query = "
+                with pgql_class as (
+                    select oid, relname, relkind
+                    from pg_class
+                    where relnamespace = $1::int::oid
+                ), pgql_relations as (
+                    select c.oid, c.relname
+                    from pgql_class c
+                    where c.relkind = any(array['r', 'v'])
+                )
+                select oid::int, relname
+                from pgql_relations
+            ";
+
+            let relations = futures::future::join_all(client
+                .query(query, &[&oid])
                 .await
                 .unwrap()
                 .iter()
-                .map(|table| Relation {
-                    name: table.get("name"),
-                })
-                .collect();
+                .map(|table| Relation::from(
+                    client,
+                    table.get("oid"),
+                    table.get("relname")
+                ))
+                .collect::<Vec<_>>()).await;
 
             Self { name, relations }
         })
@@ -43,12 +96,9 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn from(pool: &crate::connection::Pool) -> juniper::BoxFuture<Self> {
+    pub fn from<'a>(client: &'a tokio_postgres::Transaction<'a>) -> juniper::BoxFuture<'a, Self> {
         Box::pin(async move {
-            let name: String = pool
-                .get()
-                .await
-                .unwrap()
+            let name: String = client
                 .query_one("select current_database()", &[])
                 .await
                 .unwrap()
@@ -56,15 +106,15 @@ impl Database {
 
             Self {
                 name: name.clone(),
-                schemas: Self::find_schemas(pool, name).await,
+                schemas: Self::find_schemas(client, name).await,
             }
         })
     }
 
-    fn find_schemas(
-        pool: &crate::connection::Pool,
+    fn find_schemas<'a>(
+        client: &'a tokio_postgres::Transaction<'a>,
         database: String,
-    ) -> juniper::BoxFuture<Vec<Schema>> {
+    ) -> juniper::BoxFuture<'a, Vec<Schema>> {
         Box::pin(async move {
             let query = "
                 select description
@@ -73,10 +123,7 @@ impl Database {
                 where datname = $1
             ";
 
-            let comment: String = pool
-                .get()
-                .await
-                .unwrap()
+            let comment: String = client
                 .query_opt(query, &[&database])
                 .await
                 .unwrap()
@@ -85,7 +132,7 @@ impl Database {
             futures::future::join_all(
                 comment
                     .split(',')
-                    .map(|name| Schema::from(pool, name.into())),
+                    .map(|name| Schema::from(client, name.into())),
             )
             .await
         })
@@ -108,8 +155,20 @@ pub struct Introspection {
 impl Introspection {
     pub fn from(pool: &crate::connection::Pool) -> juniper::BoxFuture<Self> {
         Box::pin(async move {
+            let mut connection = pool
+                .get()
+                .await
+                .unwrap();
+
+            let transaction = connection
+                .build_transaction()
+                .read_only(true)
+                .start()
+                .await
+                .unwrap();
+
             Self {
-                database: Database::from(pool).await,
+                database: Database::from(&transaction).await,
             }
         })
     }
